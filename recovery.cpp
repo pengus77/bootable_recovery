@@ -31,6 +31,7 @@
 #include <functional>
 #include <iterator>
 #include <memory>
+#include <regex>
 #include <string>
 #include <vector>
 
@@ -169,11 +170,11 @@ static bool yes_no(Device* device, const char* question1, const char* question2)
 }
 
 static bool ask_to_wipe_data(Device* device) {
-  std::vector<std::string> headers{ "Wipe all user data?", "  THIS CAN NOT BE UNDONE!" };
-  std::vector<std::string> items{ " Cancel", " Factory data reset" };
+  std::vector<std::string> headers{ "Format user data?", "This includes internal storage.", "THIS CANNOT BE UNDONE!" };
+  std::vector<std::string> items{ " Cancel", " Format data" };
 
-  size_t chosen_item = device->GetUI()->ShowPromptWipeDataConfirmationMenu(
-      headers, items,
+  size_t chosen_item = device->GetUI()->ShowMenu(
+      headers, items, 0, true,
       std::bind(&Device::HandleMenuKey, device, std::placeholders::_1, std::placeholders::_2));
 
   return (chosen_item == 1);
@@ -261,7 +262,10 @@ static void choose_recovery_file(Device* device) {
     if (chosen_item == static_cast<size_t>(RecoveryUI::KeyError::INTERRUPTED)) {
       break;
     }
-    if (entries[chosen_item] == "Back") break;
+    if (chosen_item == Device::kGoHome || chosen_item == Device::kGoBack ||
+        chosen_item == entries.size() - 1) {
+      break;
+    }
 
     device->GetUI()->ShowFile(entries[chosen_item]);
   }
@@ -384,19 +388,20 @@ static Device::BuiltinAction PromptAndWait(Device* device, InstallResult status)
     }
     ui->SetProgressType(RecoveryUI::EMPTY);
 
-    std::vector<std::string> headers;
-    if (update_in_progress) {
-      headers = { "WARNING: Previous installation has failed.",
-                  "  Your device may fail to boot if you reboot or power off now." };
-    }
-
+change_menu:
     size_t chosen_item = ui->ShowMenu(
-        headers, device->GetMenuItems(), 0, false,
+        device->GetMenuHeaders(), device->GetMenuItems(), 0, false,
         std::bind(&Device::HandleMenuKey, device, std::placeholders::_1, std::placeholders::_2));
     // Handle Interrupt key
     if (chosen_item == static_cast<size_t>(RecoveryUI::KeyError::INTERRUPTED)) {
       return Device::KEY_INTERRUPTED;
     }
+
+    if (chosen_item == Device::kGoBack || chosen_item == Device::kGoHome) {
+      device->GoHome();
+      goto change_menu;
+    }
+
     // Device-specific code may take some action here. It may return one of the core actions
     // handled in the switch statement below.
     Device::BuiltinAction chosen_action =
@@ -405,6 +410,12 @@ static Device::BuiltinAction PromptAndWait(Device* device, InstallResult status)
             : device->InvokeMenuItem(chosen_item);
 
     switch (chosen_action) {
+      case Device::MENU_BASE:
+      case Device::MENU_UPDATE:
+      case Device::MENU_WIPE:
+      case Device::MENU_ADVANCED:
+        goto change_menu;
+
       case Device::REBOOT_FROM_FASTBOOT:    // Can not happen
       case Device::SHUTDOWN_FROM_FASTBOOT:  // Can not happen
       case Device::NO_ACTION:
@@ -448,9 +459,19 @@ static Device::BuiltinAction PromptAndWait(Device* device, InstallResult status)
       case Device::WIPE_CACHE: {
         save_current_log = true;
         std::function<bool()> confirm_func = [&device]() {
-          return yes_no(device, "Wipe cache?", "  THIS CAN NOT BE UNDONE!");
+          return yes_no(device, "Format cache?", "  THIS CAN NOT BE UNDONE!");
         };
         WipeCache(ui, ui->IsTextVisible() ? confirm_func : nullptr);
+        if (!ui->IsTextVisible()) return Device::NO_ACTION;
+        break;
+      }
+
+      case Device::WIPE_SYSTEM: {
+        save_current_log = true;
+        std::function<bool()> confirm_func = [&device]() {
+          return yes_no(device, "Format system?", "  THIS CAN NOT BE UNDONE!");
+        };
+        WipeSystem(ui, ui->IsTextVisible() ? confirm_func : nullptr);
         if (!ui->IsTextVisible()) return Device::NO_ACTION;
         break;
       }
@@ -480,6 +501,9 @@ static Device::BuiltinAction PromptAndWait(Device* device, InstallResult status)
         if (status == INSTALL_REBOOT) {
           return reboot_action;
         }
+        if (status == INSTALL_NONE) {
+          update_in_progress = false;
+        }
 
         if (status == INSTALL_SUCCESS) {
           update_in_progress = false;
@@ -496,6 +520,14 @@ static Device::BuiltinAction PromptAndWait(Device* device, InstallResult status)
 
       case Device::VIEW_RECOVERY_LOGS:
         choose_recovery_file(device);
+        break;
+
+      case Device::ENABLE_ADB:
+        android::base::SetProperty("ro.adb.secure.recovery", "0");
+        android::base::SetProperty("ctl.restart", "adbd");
+        device->RemoveMenuItemForAction(Device::ENABLE_ADB);
+        device->GoHome();
+        ui->Print("Enabled ADB.\n");
         break;
 
       case Device::RUN_GRAPHICS_TEST:
@@ -701,9 +733,22 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
     ui->SetStage(st_cur, st_max);
   }
 
-  std::vector<std::string> title_lines =
-      android::base::Split(android::base::GetProperty("ro.bootimage.build.fingerprint", ""), ":");
-  title_lines.insert(std::begin(title_lines), "Android Recovery");
+  // Extract the YYYYMMDD date from the full version string. Assume
+  // the first instance of "-[0-9]{8}-" (if any) has the desired date.
+  std::string ver = android::base::GetProperty("ro.lineage.version", "");
+  std::smatch ver_date_match;
+  std::regex_search(ver, ver_date_match, std::regex("-(\\d{8})-"));
+  std::string ver_date = ver_date_match.str(1);  // Empty if no match.
+
+  std::vector<std::string> title_lines = {
+    "Version " + android::base::GetProperty("ro.lineage.build.version", "(unknown)") +
+        " (" + ver_date + ")",
+  };
+  if (android::base::GetBoolProperty("ro.build.ab_update", false)) {
+    std::string slot = android::base::GetProperty("ro.boot.slot_suffix", "");
+    if (android::base::StartsWith(slot, "_")) slot.erase(0, 1);
+    title_lines.push_back("Active slot: " + slot);
+  }
   ui->SetTitle(title_lines);
 
   ui->ResetKeyInterruptStatus();
@@ -837,12 +882,10 @@ Device::BuiltinAction start_recovery(Device* device, const std::vector<std::stri
     status = ApplyFromAdb(device, true /* rescue_mode */, &next_action);
     ui->Print("\nInstall from ADB complete (status: %d).\n", status);
   } else if (!just_exit) {
-    // If this is an eng or userdebug build, automatically turn on the text display if no command
-    // is specified. Note that this should be called before setting the background to avoid
+    // Always show menu if no command is specified.
+    // Note that this should be called before setting the background to avoid
     // flickering the background image.
-    if (IsRoDebuggable()) {
-      ui->ShowText(true);
-    }
+    ui->ShowText(true);
     status = INSTALL_NONE;  // No command specified
     ui->SetBackground(RecoveryUI::NO_COMMAND);
   }

@@ -24,6 +24,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <sys/mount.h>
 
 #include <iostream>
 #include <string>
@@ -37,12 +38,23 @@
 #include <ext4_utils/wipe.h>
 #include <fs_mgr.h>
 #include <fs_mgr/roots.h>
+#include <fs_mgr_dm_linear.h>
 
 #include "otautil/sysutil.h"
 
 using android::fs_mgr::Fstab;
 using android::fs_mgr::FstabEntry;
 using android::fs_mgr::ReadDefaultFstab;
+
+static void write_fstab_entry(const FstabEntry& entry, FILE* file) {
+  if (entry.fs_type != "emmc" && !entry.fs_mgr_flags.vold_managed && !entry.blk_device.empty() &&
+      entry.blk_device[0] == '/' && !entry.mount_point.empty() && entry.mount_point[0] == '/') {
+    fprintf(file, "%s ", entry.blk_device.c_str());
+    fprintf(file, "%s ", entry.mount_point.c_str());
+    fprintf(file, "%s ", entry.fs_type.c_str());
+    fprintf(file, "%s 0 0\n", entry.fs_options.empty() ? entry.fs_options.c_str() : "defaults");
+  }
+}
 
 static Fstab fstab;
 
@@ -52,6 +64,12 @@ void load_volume_table() {
   if (!ReadDefaultFstab(&fstab)) {
     LOG(ERROR) << "Failed to read default fstab";
     return;
+  }
+
+  // Create a boring /etc/fstab so tools like Busybox work
+  FILE* file = fopen("/etc/fstab", "w");
+  if (!file) {
+    LOG(ERROR) << "Unable to create /etc/fstab";
   }
 
   fstab.emplace_back(FstabEntry{
@@ -67,8 +85,15 @@ void load_volume_table() {
     std::cout << "  " << i << " " << entry.mount_point << " "
               << " " << entry.fs_type << " " << entry.blk_device << " " << entry.length
               << std::endl;
+    if (file) {
+      write_fstab_entry(entry, file);
+    }
   }
   std::cout << std::endl;
+
+  if (file) {
+    fclose(file);
+  }
 }
 
 Volume* volume_for_mount_point(const std::string& mount_point) {
@@ -87,6 +112,27 @@ int ensure_path_mounted(const std::string& path) {
 
 int ensure_path_unmounted(const std::string& path) {
   return android::fs_mgr::EnsurePathUnmounted(&fstab, path) ? 0 : -1;
+}
+
+int ensure_volume_unmounted(const std::string& blk_device) {
+  android::fs_mgr::Fstab mounted_fstab;
+  if (!android::fs_mgr::ReadFstabFromFile("/proc/mounts", &mounted_fstab)) {
+    LOG(ERROR) << "Failed to read /proc/mounts";
+    return -1;
+  }
+
+  /* find any entries with the volume */
+  for (auto& entry : mounted_fstab) {
+    if (entry.blk_device == blk_device) {
+      int result = umount(entry.mount_point.c_str());
+      if (result == -1) {
+        LOG(ERROR) << "Failed to unmount " << blk_device << " from " << entry.mount_point << ": "
+                   << errno;
+        return -1;
+      }
+    }
+  }
+  return 0;
 }
 
 static int exec_cmd(const std::vector<std::string>& args) {
@@ -144,7 +190,7 @@ int format_volume(const std::string& volume, const std::string& directory) {
     LOG(ERROR) << "can't give path \"" << volume << "\" to format_volume";
     return -1;
   }
-  if (ensure_path_unmounted(volume) != 0) {
+  if (ensure_volume_unmounted(v->blk_device) != 0) {
     LOG(ERROR) << "format_volume: Failed to unmount \"" << v->mount_point << "\"";
     return -1;
   }
@@ -284,6 +330,8 @@ int format_volume(const std::string& volume) {
   return format_volume(volume, "");
 }
 
+static bool logical_partitions_auto_mapped = false;
+
 int setup_install_mounts() {
   if (fstab.empty()) {
     LOG(ERROR) << "can't set up install mounts: no fstab loaded";
@@ -307,6 +355,16 @@ int setup_install_mounts() {
       }
     }
   }
+  // Map logical partitions
+  if (android::base::GetBoolProperty("ro.boot.dynamic_partitions", false) &&
+      !logical_partitions_mapped()) {
+    std::string super_name = fs_mgr_get_super_partition_name();
+    if (!android::fs_mgr::CreateLogicalPartitions("/dev/block/by-name/" + super_name)) {
+      LOG(ERROR) << "Failed to map logical partitions";
+    } else {
+      logical_partitions_auto_mapped = true;
+    }
+  }
   return 0;
 }
 
@@ -314,4 +372,8 @@ bool HasCache() {
   CHECK(!fstab.empty());
   static bool has_cache = volume_for_mount_point(CACHE_ROOT) != nullptr;
   return has_cache;
+}
+
+bool logical_partitions_mapped() {
+  return android::fs_mgr::LogicalPartitionsMapped() || logical_partitions_auto_mapped;
 }
